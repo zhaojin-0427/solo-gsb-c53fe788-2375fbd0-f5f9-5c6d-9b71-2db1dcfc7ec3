@@ -334,10 +334,11 @@ def test_gradient_adaptive_step_recovers_biased_small_slope():
 
     expr = compile_expression("a + 1e-4*b", ("a", "b"))
     x = {"a": 1.0, "b": 0.0}
-    grad, noise = numerical_gradient_with_noise(expr, x, ("a", "b"))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, x, ("a", "b"))
     assert abs(grad[0] - 1.0) < 1e-9
     assert abs(grad[1] - 1e-4) < 1e-9
     # 恢复后梯度必须显著高于自身舍入尺度（可辨）
+    assert resolved[1]
     assert abs(grad[1]) > GRADIENT_RESOLUTION_FACTOR * noise[1]
 
 
@@ -347,9 +348,9 @@ def test_gradient_true_flat_direction_is_zero_at_any_scale():
     from app.engine import numerical_gradient_with_noise
 
     expr = compile_expression("2*(a - a) + b", ("a", "b"))
-    grad, noise = numerical_gradient_with_noise(expr, {"a": 1.0, "b": 2.0}, ("a", "b"))
-    assert grad[0] == 0.0
-    assert abs(grad[1] - 1.0) < 1e-9
+    grad, _, resolved = numerical_gradient_with_noise(expr, {"a": 1.0, "b": 2.0}, ("a", "b"))
+    assert grad[0] == 0.0 and not bool(resolved[0])
+    assert abs(grad[1] - 1.0) < 1e-9 and resolved[1]
 
 
 def test_gradient_zero_nominal_without_bias_unchanged():
@@ -358,9 +359,10 @@ def test_gradient_zero_nominal_without_bias_unchanged():
     from app.engine import numerical_gradient_with_noise
 
     expr = compile_expression("a + 1e-13*b", ("a", "b"))
-    grad, noise = numerical_gradient_with_noise(expr, {"a": 0.0, "b": 0.0}, ("a", "b"))
-    assert grad[0] == 1.0
+    grad, _, resolved = numerical_gradient_with_noise(expr, {"a": 0.0, "b": 0.0}, ("a", "b"))
+    assert grad[0] == 1.0 and resolved[0]
     assert abs(grad[1] - 1e-13) < 1e-25  # 1e-13 字面量双精度存储尾差 ~1e-29
+    assert resolved[1]
 
 
 def test_gradient_widening_stops_at_domain_boundary():
@@ -371,6 +373,64 @@ def test_gradient_widening_stops_at_domain_boundary():
     from app.engine import numerical_gradient_with_noise
 
     expr = compile_expression("1.0 + 1e-10*sqrt(x)", ("x",))
-    grad, noise = numerical_gradient_with_noise(expr, {"x": 1e-8}, ("x",))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, {"x": 1e-8}, ("x",))
     assert np.isfinite(grad[0])
-    assert grad[0] > 0.0  # 真实正斜率 1e-10/(2*sqrt(1e-8)) = 5e-7
+    # 真实正斜率 1e-10/(2*sqrt(1e-8)) = 5e-7：对称扩步被定义域截断后，
+    # 域内单侧探针 + Richardson 外推回收可信斜率并标记为可辨——不能被
+    # 偏置舍入门槛误判为零（旧实现 upper=null 误报的根因）。
+    assert resolved[0]
+    assert abs(grad[0] - 5e-7) / 5e-7 < 0.05
+
+
+def test_gradient_domain_fallback_distinguishes_true_zero_near_edge():
+    # 同一域边界几何形态下的真零斜率 1 + 0*sqrt(x)：单侧探针全部恒等，
+    # 必须仍判零（resolved=False、梯度严格 0）。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    expr = compile_expression("1.0 + 0.0*sqrt(x)", ("x",))
+    grad, _, resolved = numerical_gradient_with_noise(expr, {"x": 1e-8}, ("x",))
+    assert grad[0] == 0.0 and not bool(resolved[0])
+
+
+def test_gradient_initial_step_shrinks_inside_domain():
+    # h0（~6e-6）大于名义点到 asin 上边缘的距离（1e-8）：初始探针越界，
+    # 向内收缩到域内即可辨，不抛错；负方向边缘的 log(x0) 同理。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    x0 = 1.0 - 1e-8
+    expr = compile_expression("asin(x)", ("x",))
+    grad, _, resolved = numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
+    assert resolved[0]
+    assert abs(grad[0] - 1.0 / math.sqrt(2e-8)) / (1.0 / math.sqrt(2e-8)) < 1e-2
+
+    expr = compile_expression("log(x)", ("x",))
+    grad, _, resolved = numerical_gradient_with_noise(expr, {"x": 1e-8}, ("x",))
+    assert resolved[0]
+    assert abs(grad[0] - 1e8) / 1e8 < 1e-2
+
+
+def test_gradient_nominal_on_open_domain_edge_still_raises():
+    # 名义点本身就在开域边界（sqrt(0)、log(0)）：任何收缩步长都越界，
+    # 保持历史行为，直接抛 PropagationError。
+    import pytest
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+    from app.errors import PropagationError
+
+    for source in ("sqrt(x)", "log(x)"):
+        expr = compile_expression(source, ("x",))
+        with pytest.raises(PropagationError):
+            numerical_gradient_with_noise(expr, {"x": 0.0}, ("x",))
+
+
+def test_gradient_domain_fallback_negative_side():
+    # sqrt(-x) 的定义域在左侧：开阔侧为 −h 方向，回收负斜率。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    expr = compile_expression("1.0 + 1e-10*sqrt(-x)", ("x",))
+    grad, _, resolved = numerical_gradient_with_noise(expr, {"x": -1e-8}, ("x",))
+    assert resolved[0]
+    assert abs(grad[0] + 5e-7) / 5e-7 < 0.05

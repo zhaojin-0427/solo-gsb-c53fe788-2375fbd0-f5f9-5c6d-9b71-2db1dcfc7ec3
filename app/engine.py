@@ -273,7 +273,7 @@ def _evaluate_scalar(compiled: CompiledExpression, env_base: Mapping[str, float]
 
 def numerical_gradient(compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]) -> np.ndarray:
     """中心差分灵敏度 dy/dx（基本单位空间）。"""
-    grad, _ = numerical_gradient_with_noise(compiled, x_base, names)
+    grad, _, _ = numerical_gradient_with_noise(compiled, x_base, names)
     return grad
 
 
@@ -294,20 +294,186 @@ _GRADIENT_STEP_GROWTH = 8.0
 #: 回退到漂移前的小步长。
 _GRADIENT_STABILITY = 0.5
 
+#: 对称探针在初始 h0 就越过定义域时，按该倍数收缩步长直到两侧都落在
+#: 有效域内（如 asin(1-1e-8) 的边缘距离只有 1e-8，远小于 h0≈6e-6）。
+_GRADIENT_STEP_SHRINK = 8.0
+_GRADIENT_STEP_SHRINK_MAX = 16
+
+#: 定义域截断对称扩步时，域内单侧探针网格的参数：
+#: 以域内最大有限对称步长 h_edge 为锚点、按 ×2 几何级数向开阔侧布点；
+#: 对单侧差商 D_m = (f(x0+s·2^m·h_edge)-f(x0))/(s·2^m·h_edge) 做
+#: Richardson 外推（消去 O(h)、O(h²) 截断项）。sqrt 这类 x^(1/2) 在
+#: 域边缘的 Taylor 级数全阶非零，外推阶数不宜高：取到二阶且当对角
+#: 相邻级相对漂移超过 _ONESIDED_STABILITY 时停在上一级（噪声接管）。
+_ONESIDED_LEVELS = 10
+_ONESIDED_MAX_ORDER = 2
+_ONESIDED_STABILITY = 0.25
+
+
+def _try_scalar(compiled: CompiledExpression, env_base: Mapping[str, float]) -> float | None:
+    """求值并返回 float；结果非有限（NaN/Inf）或求值失败时返回 ``None``。
+
+    用于定义域敏感的探针：探针越过模型定义域（如 sqrt/log 的负数自变量、
+    asin 的 |x|>1）时返回 None，由调用方向内收缩/换侧，而不是直接抛错。
+    """
+    try:
+        with np.errstate(all="ignore"):
+            yv = float(np.asarray(numpy_evaluation(compiled, env_base), dtype=float))
+    except (PropagationError, ValueError, ZeroDivisionError, OverflowError):
+        return None
+    if not math.isfinite(yv):
+        return None
+    return yv
+
+
+def _probe_pair(compiled, x_base: Mapping[str, float], name: str, x0: float, step: float):
+    """对称探针 (f(x0+h), f(x0-h))；任一侧越界/非有限则返回 None。"""
+    env_plus = dict(x_base)
+    env_minus = dict(x_base)
+    env_plus[name] = x0 + step
+    env_minus[name] = x0 - step
+    yp = _try_scalar(compiled, env_plus)
+    ym = _try_scalar(compiled, env_minus)
+    if yp is None or ym is None:
+        return None
+    return yp, ym
+
+
+def _richardson_onesided(Ds: list[float]) -> tuple[float, int]:
+    """单侧等比（因子 2）差商的 Richardson 外推，沿外推表第 0 列定阶。
+
+    D_m 对单侧差分含全阶截断误差 D(h) = g + c1·h + c2·h² + …；第 r 级
+    递推 T_r[i] = (2^r·T_{r-1}[i] - T_{r-1}[i+1])/(2^r - 1) 依次消去
+    O(h^r) 项。sqrt 型函数在边缘处级数收敛慢、高阶外推还会放大舍入，
+    故相对相邻级的改善一旦低于 :data:`_ONESIDED_STABILITY` 即停止。
+    """
+    g = Ds[0]
+    order = 0
+    prev = Ds
+    for r in range(1, _ONESIDED_MAX_ORDER + 1):
+        if len(prev) < 2:
+            break
+        qr = 2.0 ** r
+        nxt = [(qr * prev[i] - prev[i + 1]) / (qr - 1) for i in range(len(prev) - 1)]
+        cur = nxt[0]
+        if abs(cur - g) > _ONESIDED_STABILITY * max(abs(cur), abs(g)):
+            break
+        g, order, prev = cur, r, nxt
+    return g, order
+
+
+def _richardson_l1(order: int) -> float:
+    """第 ``order`` 级第 0 列外推相对原始差商的系数 L1 和（舍入放大倍数）。
+
+    递推 T_r[i] = (q·T_{r-1}[i] - T_{r-1}[i+1])/(q-1)（q = 2^r）在第 0
+    列对原始 D_0…D_r 的系数满足 c_0←q/(q-1)·c_0，c_j←q/(q-1)·c_j
+    −1/(q-1)·c_{j-1}（j=1..r-1），c_r←−1/(q-1)·c_{r-1}。
+    """
+    coeffs = [1.0]
+    for r in range(1, order + 1):
+        qr = 2.0 ** r
+        a = qr / (qr - 1.0)
+        b = -1.0 / (qr - 1.0)
+        nxt = [0.0] * (len(coeffs) + 1)
+        for j, c in enumerate(coeffs):
+            nxt[j] += a * c
+            nxt[j + 1] += b * c
+        coeffs = nxt
+    return sum(abs(c) for c in coeffs)
+
+
+def _onesided_domain_fallback(
+    compiled: CompiledExpression,
+    x_base: Mapping[str, float],
+    name: str,
+    x0: float,
+    h_last: float,
+    h_cap: float,
+    f0: float,
+) -> tuple[float, float, bool]:
+    """对称扩步被模型定义域截断时的域内单侧探针回退。
+
+    背景：近定义域边界的名义点（如 y = 1 + 1e-10·sqrt(x)，x0 = 1e-8），
+    对称探针一旦 h > x0 就因 x0-h < 0 越界，步长被压在远小于
+    ``h_cap = eps^(1/3)`` 的尺度上；偏置 1.0 的舍入（1 ulp ≈ 2.2e-16）
+    把真实斜率 5e-7 的差分值完全淹没，百倍门槛判零。但向**开阔侧**
+    （sqrt 即 +h 方向）探针不受边界限制，可以走到差分值远超舍入尺度
+    的步长上确认斜率真实非零，再以 Richardson 外推消去单侧差分的
+    O(h)、O(h²) 曲率截断，回收可信斜率。
+
+    返回 ``(gradient, noise, resolved)``：
+
+    * 先用 ×2 步行把“域内最大有限对称步长”收紧到真实边缘的 2 倍以内；
+    * 以该步长为锚点分别向两侧布单侧网格，取可延伸更远（更开阔）的一侧；
+    * ``resolved`` 只要任一原始探针的差分超过百倍输出舍入尺度即为真——
+      真零斜率（如 1 + 0·sqrt(x)）所有探针恒等，仍判零；
+    * 不可辨时梯度严格归 0，``noise`` 为外推系数 L1 放大后的舍入尺度。
+    """
+    # 1. 定位域边缘：从最后一个有限对称步长 ×2 收紧（两次相邻尝试间 ≤2×）
+    h_edge = h_last
+    while h_edge < h_cap:
+        hn = h_edge * 2.0
+        if _probe_pair(compiled, x_base, name, x0, hn) is None:
+            break
+        h_edge = hn
+
+    # 2. 分别向两侧布单侧网格，选开阔侧（可延伸的有限探针层数更多）
+    def grid(side: int) -> tuple[list[float], list[float], int, float]:
+        hs: list[float] = []
+        Ds: list[float] = []
+        n_resolved = 0
+        fscale = abs(f0)
+        h = h_edge
+        for _ in range(_ONESIDED_LEVELS):
+            env = dict(x_base)
+            env[name] = x0 + side * h
+            fp = _try_scalar(compiled, env)
+            if fp is None:
+                break
+            fscale = max(fscale, abs(fp))
+            hs.append(h)
+            Ds.append((fp - f0) / (side * h))
+            if abs(fp - f0) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(fp), abs(f0)):
+                n_resolved += 1
+            h *= 2.0
+        return hs, Ds, n_resolved, fscale
+
+    grids = {side: grid(side) for side in (+1, -1)}
+    # 开阔侧：有限层数多者优先；层数相同（如两侧都开阔）时可辨探针多者优先
+    side = max((+1, -1), key=lambda s: (len(grids[s][0]), grids[s][2]))
+    hs, Ds, n_resolved, fscale = grids[side]
+
+    if not Ds:
+        return 0.0, _EPS * abs(f0) / max(h_edge, _EPS), False
+
+    # 3. Richardson 外推定阶（至少 2 层；仅 1 层时只能用原始差商，
+    # 外推系数 L1 退化为 1，即普通单侧差分的舍入尺度）
+    if len(Ds) >= 2:
+        g, order = _richardson_onesided(Ds)
+    else:
+        g, order = Ds[0], 0
+    noise = _EPS * fscale * _richardson_l1(order) / hs[0]
+
+    # 4. 零/非零裁决只看原始探针是否可辨（外推值在零函数上也可能偶然非零）
+    if n_resolved == 0:
+        return 0.0, noise, False
+    return g, noise, True
+
 
 def numerical_gradient_with_noise(
     compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]
-) -> tuple[np.ndarray, np.ndarray]:
-    """中心差分灵敏度及其逐分量舍入误差尺度（基本单位空间）。
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """中心差分灵敏度、逐分量舍入误差尺度与逐分量“可辨”标志（基本单位空间）。
 
-    返回 ``(grad, noise)``。``noise[k]`` 估计函数值舍入（~eps·|f|）经
-    ``(f(x+h)-f(x-h))/(2h)`` 传播到第 k 个梯度分量的量级：
+    返回 ``(grad, noise, resolved)``。``noise[k]`` 估计函数值舍入（~eps·|f|）
+    经 ``(f(x+h)-f(x-h))/(2h)`` 传播到第 k 个梯度分量的量级：
 
         noise[k] = eps · max(|f(x+h)|, |f(x-h)|) / (2h)
 
-    它随问题自身尺度收缩（小量级模型的 noise 同样小）。真实梯度只有
-    远低于该尺度时才与舍入噪声不可区分——“零灵敏度”裁决必须用它
-    （逐输入、按自身尺度），绝不能与其他输入的灵敏度量级比较。
+    它随问题自身尺度收缩（小量级模型的 noise 同样小）。``resolved[k]``
+    表示第 k 个方向上存在超过输出舍入尺度百倍门槛的真实差分信号——
+    “零灵敏度”裁决应直接用它（逐输入、按自身尺度），绝不能与其他输入
+    的灵敏度量级比较。
 
     **输出偏置自适应步长。** 名义点为 0（或极小）时初始步长
     ``h0 = eps^(2/3)`` 也极小；若输出在名义点带大偏置（如 y = 1 + 1e-4·b，
@@ -322,67 +488,108 @@ def numerical_gradient_with_noise(
     缩小（漂移恒小），故一路放大到 h_cap 获得高精度梯度；一旦单步相对
     漂移超过 :data:`_GRADIENT_STABILITY`（截断误差 O(h²) 随 8 倍步长
     增长 64 倍的特征），回退采用漂移前的小步长，避免在高曲率零名义点
-    把截断伪影当成灵敏度。放大后的步长若越过模型定义域（如 ``sqrt(x)``
-    在极小正名义点处 x-h < 0 产生 NaN），立即停止放大并保留上一个有限
-    步长（初始 h0 就非有限时依旧抛错，与历史行为一致）。真正零/无扰动
-    方向（f+ == f- 恒成立，如 ``2*(a-a)``）逐级放大到上限仍不可辨，
-    梯度保持 0.0，噪声按最终步长（只会更严格）计算。
+    把截断伪影当成灵敏度。
+
+    **初始探针即越界（h0 越过定义域）。** 如 asin(1-1e-8) 的边缘距离
+    只有 1e-8 ≪ h0，log(x0) 在 x0-h≤0 处无定义：按 8 倍向内收缩步长
+    直到两侧探针都落在有效域内（至多 :data:`_GRADIENT_STEP_SHRINK_MAX`
+    次），再走正常的放大/稳定流程；收缩后仍无可用探针（如名义点本身
+    就在 sqrt/log 的开域边界 x0=0）才抛错——与历史行为一致。
+
+    **定义域截断扩步（近边界误报的修复路径）。** 放大后的步长越过模型
+    定义域（如 sqrt 在极小正名义点处 x-h < 0 产生 NaN）时，对称扩步
+    被迫停在远小于 h_cap 的步长上；若此时差分仍被输出偏置的舍入淹没，
+    转入 :func:`_onesided_domain_fallback`：定位域边缘，以域内最大对称
+    步长为锚点向开阔侧按 ×2 布单侧探针，用原始探针的可辨性区分真实
+    斜率与真零/偏置舍入，并以 Richardson 外推消除单侧差分的曲率截断
+    误差，回收可信梯度（如 y = 1 + 1e-10·sqrt(x)，x0 = 1e-8 的真实
+    斜率 5e-7）。真正零/无扰动方向（f+ == f- 恒成立，如 ``2*(a-a)``、
+    ``1 + 0*sqrt(x)``）所有探针差分为零，resolved=False、梯度保持 0.0。
     """
     grad = np.zeros(len(names))
     noise = np.zeros(len(names))
+    resolved_flag = np.zeros(len(names), dtype=bool)
     for k, name in enumerate(names):
         x0 = x_base[name]
         h = _EPS13 * max(abs(x0), _EPS13)
         h_cap = _EPS13 * max(abs(x0), 1.0)
 
-        def probe(step: float) -> tuple[float, float, float, bool]:
-            env_plus = dict(x_base)
-            env_minus = dict(x_base)
-            env_plus[name] = x0 + step
-            env_minus[name] = x0 - step
-            # 放大后的步长可能越过模型定义域（如 sqrt/log 在 x-h < 0 处给
-            # NaN）：NaN 会被 _evaluate_scalar 转成 PropagationError 由外层
-            # 捕获，告警本身无意义，压掉避免污染日志（与 MC 路径一致）。
-            with np.errstate(all="ignore"):
-                yp = _evaluate_scalar(compiled, env_plus)
-                ym = _evaluate_scalar(compiled, env_minus)
-            g = (yp - ym) / (2.0 * step)
-            resolved = abs(yp - ym) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(yp), abs(ym))
-            return yp, ym, g, resolved
+        # 初始探针：对称步长（可能极小或越过定义域）
+        pair = _probe_pair(compiled, x_base, name, x0, h)
+        initial_blocked = pair is None
+        if initial_blocked:
+            pair = None
+            for _ in range(_GRADIENT_STEP_SHRINK_MAX):
+                h /= _GRADIENT_STEP_SHRINK
+                pair = _probe_pair(compiled, x_base, name, x0, h)
+                if pair is not None:
+                    break
+            if pair is None:
+                # 名义点本身就在开域边界（如 sqrt(0)/log(0)）：历史行为抛错
+                raise PropagationError(
+                    "模型在名义点（或其邻域）产生了非有限结果（NaN/Inf），无法传播不确定度"
+                )
+        yp, ym = pair
+        g = (yp - ym) / (2.0 * h)
+        resolved = abs(yp - ym) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(yp), abs(ym))
 
-        # 初始 h0 非有限（NaN/Inf，定义域被越过）：直接抛错（历史行为）
-        yp, ym, g, resolved = probe(h)
-
-        # 阶段 1：差分值被输出舍入淹没 => 放大步长直到可辨或到达 h_cap
+        # 阶段 1：差分值被输出舍入淹没 => 放大步长直到可辨或到达 h_cap。
+        # 初始 h0 即越界后又被收缩的情形（initial_blocked）不进入扩步
+        # 阶段 2 的高精度放大——它的“名义尺度”是边缘距离而非 eps^(1/3)，
+        # 继续放大立刻撞墙（log 在 x0-h≤0）或被曲率接管（asin 在 x=1）。
         grew = False
+        domain_blocked = False
         if not resolved:
             while not resolved and h < h_cap:
                 hn = min(h * _GRADIENT_STEP_GROWTH, h_cap)
-                try:
-                    ynp, ynm, gnew, rnew = probe(hn)
-                except PropagationError:
+                nxt = _probe_pair(compiled, x_base, name, x0, hn)
+                if nxt is None:
+                    domain_blocked = True
                     break  # 放大越过定义域：保留当前有限步长
-                h, yp, ym, g, resolved = hn, ynp, ynm, gnew, rnew
+                h, (yp, ym) = hn, nxt
+                g = (yp - ym) / (2.0 * h)
+                resolved = abs(yp - ym) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(yp), abs(ym))
                 grew = True
 
-        # 阶段 2（仅当偏置迫使步长放大过）：继续放大到 h_cap 进一步压低
-        # 偏置导致的舍入误差；一旦梯度出现截断性漂移（或越过定义域）即
-        # 回退/停止。h0 已可辨时不进入本阶段——初始极小步长上恰被浮点
-        # 精确表示的梯度（如 sin(0)）与历史实现逐位一致。
-        if resolved and grew:
+        # 阶段 2（仅当偏置迫使步长放大过、且不是被定义域逼停）：继续放大
+        # 到 h_cap 进一步压低偏置导致的舍入误差；一旦梯度出现截断性漂移
+        # （或越过定义域）即回退/停止。h0 已可辨时不进入本阶段——初始
+        # 极小步长上恰被浮点精确表示的梯度（如 sin(0)）与历史实现逐位一致。
+        if resolved and grew and not domain_blocked and not initial_blocked:
             while h < h_cap:
                 hn = min(h * _GRADIENT_STEP_GROWTH, h_cap)
-                try:
-                    ypn, ymn, gn, rn = probe(hn)
-                except PropagationError:
+                nxt = _probe_pair(compiled, x_base, name, x0, hn)
+                if nxt is None:
                     break  # 越过定义域：保留当前有限步长
+                ypn, ymn = nxt
+                gn = (ypn - ymn) / (2.0 * hn)
+                rn = abs(ypn - ymn) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(ypn), abs(ymn))
                 if not rn or abs(gn - g) > _GRADIENT_STABILITY * max(abs(gn), abs(g)):
                     break  # 截断接管（或可辨性丧失）：保留当前 (h, g, yp, ym)
-                h, yp, ym, g, resolved = hn, ypn, ymn, gn, rn
+                h, yp, ym, g = hn, ypn, ymn, gn
+
+        if not resolved and domain_blocked:
+            # 对称扩步被定义域截断且差分仍不可辨：域内单侧探针回退。
+            # f0 此刻必然有限——否则初始探针阶段就已抛错。
+            env0 = dict(x_base)
+            env0[name] = x0
+            f0 = _try_scalar(compiled, env0)
+            if f0 is None:
+                raise PropagationError(
+                    "模型在名义点（或其邻域）产生了非有限结果（NaN/Inf），无法传播不确定度"
+                )
+            g, g_noise, g_resolved = _onesided_domain_fallback(
+                compiled, x_base, name, x0, h, h_cap, f0
+            )
+            grad[k] = g
+            noise[k] = g_noise
+            resolved_flag[k] = g_resolved
+            continue
 
         grad[k] = g
         noise[k] = _EPS * max(abs(yp), abs(ym)) / (2.0 * h)
-    return grad, noise
+        resolved_flag[k] = bool(resolved)
+    return grad, noise, resolved_flag
 
 
 # ---------------------------------------------------------------------------

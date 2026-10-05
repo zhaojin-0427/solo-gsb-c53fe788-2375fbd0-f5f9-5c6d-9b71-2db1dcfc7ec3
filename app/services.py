@@ -16,7 +16,6 @@ import pint
 
 from . import storage
 from .engine import (
-    GRADIENT_RESOLUTION_FACTOR,
     _EPS,
     _EPS13,
     build_correlation_matrix,
@@ -433,15 +432,11 @@ def _f(x: Any) -> float:
 # 测量精度反求（precision budget）
 # ---------------------------------------------------------------------------
 
-#: 名义点灵敏度判定为“零”的噪声倍数复用引擎中心差分的可辨门槛
-#: （GRADIENT_RESOLUTION_FACTOR）：差分值 |f(x+h)-f(x-h)| == |g_k|·2h
-#: 不超过输出舍入尺度 eps·max|f±| 的该倍数时，梯度被偏置舍入淹没，
-#: 判为零（如 2*(a-a) 恰为 0）。自适应步长（见 numerical_gradient_with_noise）
-#: 先放大步长到中心差分最优尺度 h_cap = eps^(1/3)·max(|x0|,1) 再裁决：
-#: 输出带大偏置的真实非零梯度（如 y = 1 + 1e-4·b, b=0）在放大后的步长上
-#: 差分值可辨，不再被误判为零；逐输入按自身尺度裁决，绝不与其他输入的
-#: 灵敏度量级比较（那会把 1e-13 级的真实微小灵敏度误判为零）。
-_ZERO_SENSITIVITY_NOISE_FACTOR = GRADIENT_RESOLUTION_FACTOR
+#: 零灵敏度裁决直接复用引擎的逐分量“可辨”标志（见
+#: numerical_gradient_with_noise 的 resolved 返回值）：只有在任何有效域内
+#: 探针（含偏置自适应放大、定义域截断后的域内单侧探针）上差分都不超过
+#: 输出舍入尺度百倍时才判零。引擎已按各分量自身步长/偏置/曲率尺度完成
+#: 裁决，反求不再重复设置任何与单位或量级相关的阈值。
 
 
 def _unit_label(spec: str) -> str:
@@ -498,7 +493,7 @@ def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
         names, [(t[0], t[1], float(t[2])) for t in record["correlations"]], zero_std
     )
 
-    grad, grad_noise = numerical_gradient_with_noise(compiled, x_base, names)
+    grad, _, grad_resolved = numerical_gradient_with_noise(compiled, x_base, names)
     if not np.all(np.isfinite(grad)):
         raise PropagationError("名义点邻域产生了非有限结果（NaN/Inf），无法进行精度反求")
 
@@ -527,10 +522,14 @@ def solve_precision_budget(req: PrecisionBudgetCreate) -> dict[str, Any]:
         C = 0.0
 
     # 4. 端点（先在基本单位空间求解）
-    # 零灵敏度裁决：与该输入梯度自身的舍入误差尺度比较（随问题尺度收缩，
-    # 小量级模型的真实微小灵敏度如 1e-13 必须保留），绝不与其他输入的
-    # 灵敏度量级比较。
-    zero_g = gk == 0.0 or abs(gk) <= _ZERO_SENSITIVITY_NOISE_FACTOR * float(grad_noise[k])
+    # 零灵敏度裁决：使用引擎逐分量的“可辨”标志——它结合差分步长、输出
+    # 偏置、曲率截断与定义域可达性（偏置自适应放大、域边缘单侧探针+
+    # Richardson 外推）按该输入自身尺度完成。近定义域边界的真实斜率
+    # （如 y = 1 + 1e-10·sqrt(x), x0=1e-8 的 5e-7）在开阔侧大跨度探针
+    # 上可辨并经外推回收；真零方向（如 2*(a-a)、1+0*sqrt(x)）所有
+    # 探针恒等，仍判零。绝不与其他输入的灵敏度量级比较（那会把 1e-13
+    # 级的真实微小灵敏度误判为零）。
+    zero_g = gk == 0.0 or not bool(grad_resolved[k])
     # 与 k 相关（登记矩阵中存在边）时，u=0 端点无效：相关系数在零方差处无定义
     correlated = any(names[k] in (t[0], t[1]) for t in record["correlations"])
 

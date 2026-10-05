@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -531,6 +532,148 @@ def test_biased_model_evaluation_pipeline_still_works(client):
     gum = r.json()["result"]["combined"]["gum"]
     assert abs(gum["value"] - 1.0) < 1e-9
     assert abs(gum["standard_uncertainty"] - 1.0) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# 近定义域边界：偏置舍入 + 曲率截断不得把真实斜率误判为零
+# ---------------------------------------------------------------------------
+
+def _near_edge_sqrt_model(version: str):
+    return {
+        "version": version,
+        "expression": "1.0 + 1e-10*sqrt(x)",
+        "inputs": [
+            {"name": "x", "value": 1e-8, "unit": "dimensionless",
+             "standard_uncertainty": 1e-9, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+
+
+def test_near_domain_edge_real_slope_gives_closed_interval(client):
+    # y = 1.0 + 1e-10*sqrt(x)，x = 1e-8、ux = 1e-9，目标 uc(y) <= 1e-7。
+    # 名义点离 sqrt 开域边界只有 1e-8：对称差分扩步遇 x-h<0 被迫停在
+    # ~2.3e-9，偏置 1.0 的舍入把真实斜率 1e-10/(2sqrt(1e-8)) = 5e-7
+    # 的差分淹没（约 11 ulp）。旧实现据噪声门槛判零，错误返回
+    # upper=null。域内单侧探针 + Richardson 外推回收可信斜率后：
+    #   v(u) = (g·u)^2 <= 1e-14  =>  u <= 1e-7/g ≈ 0.2
+    # 闭区间 [0, ~0.2]，当前 ux=1e-9（uc≈5e-16）达标。
+    _register(client, _near_edge_sqrt_model("pb-near-edge-sqrt"))
+    r = _budget(client, "pb-near-edge-sqrt", "x", 1e-7)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    sens = body["sensitivity"]["coefficient"]
+    assert abs(sens - 5e-7) / 5e-7 < 0.05  # 回收斜率（外推残差几个百分点）
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert iv["upper_inclusive"] is True and iv["upper"] is not None
+    # 上界与用回收斜率解出的 1e-7/sens 一致（约 0.2），而非 null
+    assert abs(iv["upper"] - 1e-7 / sens) / (1e-7 / sens) < 1e-9
+    assert 0.15 < iv["upper"] < 0.25
+    # 当前 ux=1e-9 远小于上界 => 达标
+    assert body["satisfied"] is True
+    assert body["current_standard_uncertainty"]["value"] == 1e-9
+    cur = body["current_combined_standard_uncertainty"]["value"]
+    assert abs(cur - sens * 1e-9) / max(cur, 1e-30) < 1e-9
+
+
+def test_near_domain_edge_tight_target_not_satisfied(client):
+    # 同一模型，目标收紧到 1e-16：当前 uc ≈ 5.16e-16 > 1e-16，不达标，
+    # 但区间仍是有限闭区间 [0, ~1.9e-10]，绝不能因不达标而变空或无界。
+    _register(client, _near_edge_sqrt_model("pb-near-edge-tight"))
+    body = _budget(client, "pb-near-edge-tight", "x", 1e-16).json()
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    assert iv["lower"] == 0.0 and iv["upper"] is not None
+    expected_upper = 1e-16 / body["sensitivity"]["coefficient"]
+    # 端点按 15 位小数序列化（既有 _f 语义，~2e-10 处绝对 ulp 1e-25，
+    # 显示成相对误差 ~2e-6），用 1e-4 容忍；量级与闭合性才是关键。
+    assert abs(iv["upper"] - expected_upper) / expected_upper < 1e-4
+    assert body["satisfied"] is False
+
+
+def test_near_domain_edge_true_zero_slope_still_unbounded(client):
+    # 同一域边界几何形态下的真零斜率 y = 1 + 0*sqrt(x)：单侧探针恒等，
+    # 仍判零 => [0, null] 无上限。
+    model = {
+        "version": "pb-near-edge-flat",
+        "expression": "1.0 + 0.0*sqrt(x)",
+        "inputs": [
+            {"name": "x", "value": 1e-8, "unit": "dimensionless",
+             "standard_uncertainty": 1e-9, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    body = _budget(client, "pb-near-edge-flat", "x", 1e-7).json()
+    assert body["sensitivity"]["coefficient"] == 0.0
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is True
+    assert iv["upper"] is None and iv["lower"] == 0.0
+    assert body["satisfied"] is True
+
+
+def test_near_domain_edge_biased_quadratic_at_zero_still_unbounded(client):
+    # 偏置下二次函数 y = 1 + x*x 在 x=0 的真零一阶项保持无上限
+    # （原有行为不被单侧回退改变）。
+    model = {
+        "version": "pb-near-edge-quad",
+        "expression": "1.0 + x*x",
+        "inputs": [
+            {"name": "x", "value": 0.0, "unit": "dimensionless",
+             "standard_uncertainty": 0.1, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    iv = _budget(client, "pb-near-edge-quad", "x", 0.05).json()["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is True
+    assert iv["upper"] is None
+
+
+def test_near_domain_edge_gum_sensitivity_matches_budget(client):
+    # 共享梯度路径：该模型的 GUM 传播灵敏度与反求灵敏度必须是同一外推值。
+    from app.expressions import compile_expression
+    from app.units import build_unit_context, parse_unit
+    from app.engine import build_correlation_matrix, run_gum
+
+    expr = compile_expression("1.0 + 1e-10*sqrt(x)", ("x",))
+    units = {"x": parse_unit("dimensionless")}
+    ctx = build_unit_context(expr, units, "dimensionless")
+    corr = build_correlation_matrix(("x",), [], set())
+    gum = run_gum(expr, ("x",), {"x": 1e-8}, np.array([1e-9]), corr, ctx)
+    assert abs(gum.sensitivities["x"] - 5e-7) / 5e-7 < 0.05
+    assert abs(gum.uc - gum.sensitivities["x"] * 1e-9) < 1e-20
+
+    body = _budget(client, "pb-near-edge-sqrt", "x", 1e-7).json()
+    # 响应系数经统一的 15 位有效数字舍入（_f），与未舍入的引擎值在该尺度一致
+    assert abs(gum.sensitivities["x"] - body["sensitivity"]["coefficient"]) < 1e-15
+    assert abs(gum.uc - body["current_combined_standard_uncertainty"]["value"]) < 1e-20
+
+
+def test_near_domain_edge_negative_side_negative_slope(client):
+    # sqrt(-x)：定义域在左侧，开阔侧为 −h，回收负斜率，区间仍有限闭。
+    model = {
+        "version": "pb-near-edge-neg",
+        "expression": "1.0 + 1e-10*sqrt(-x)",
+        "inputs": [
+            {"name": "x", "value": -1e-8, "unit": "dimensionless",
+             "standard_uncertainty": 1e-9, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    body = _budget(client, "pb-near-edge-neg", "x", 1e-7).json()
+    sens = body["sensitivity"]["coefficient"]
+    assert sens < 0.0 and abs(sens + 5e-7) / 5e-7 < 0.05
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    assert iv["upper"] is not None and iv["upper"] > 0.0
 
 
 # ---------------------------------------------------------------------------
