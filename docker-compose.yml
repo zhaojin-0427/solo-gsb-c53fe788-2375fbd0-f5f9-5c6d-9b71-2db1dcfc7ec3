@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    image: uncertainty-propagation-api:latest
+    container_name: uncertainty-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - uncertainty-data:/data
+    environment:
+      UNCERTAINTY_DB_PATH: /data/uncertainty.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  uncertainty-data:
