@@ -334,11 +334,12 @@ def test_gradient_adaptive_step_recovers_biased_small_slope():
 
     expr = compile_expression("a + 1e-4*b", ("a", "b"))
     x = {"a": 1.0, "b": 0.0}
-    grad, noise = numerical_gradient_with_noise(expr, x, ("a", "b"))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, x, ("a", "b"))
     assert abs(grad[0] - 1.0) < 1e-9
     assert abs(grad[1] - 1e-4) < 1e-9
     # 恢复后梯度必须显著高于自身舍入尺度（可辨）
     assert abs(grad[1]) > GRADIENT_RESOLUTION_FACTOR * noise[1]
+    assert bool(resolved[1]) is True
 
 
 def test_gradient_true_flat_direction_is_zero_at_any_scale():
@@ -347,8 +348,9 @@ def test_gradient_true_flat_direction_is_zero_at_any_scale():
     from app.engine import numerical_gradient_with_noise
 
     expr = compile_expression("2*(a - a) + b", ("a", "b"))
-    grad, noise = numerical_gradient_with_noise(expr, {"a": 1.0, "b": 2.0}, ("a", "b"))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, {"a": 1.0, "b": 2.0}, ("a", "b"))
     assert grad[0] == 0.0
+    assert bool(resolved[0]) is False  # 真零方向不可辨
     assert abs(grad[1] - 1.0) < 1e-9
 
 
@@ -358,7 +360,7 @@ def test_gradient_zero_nominal_without_bias_unchanged():
     from app.engine import numerical_gradient_with_noise
 
     expr = compile_expression("a + 1e-13*b", ("a", "b"))
-    grad, noise = numerical_gradient_with_noise(expr, {"a": 0.0, "b": 0.0}, ("a", "b"))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, {"a": 0.0, "b": 0.0}, ("a", "b"))
     assert grad[0] == 1.0
     assert abs(grad[1] - 1e-13) < 1e-25  # 1e-13 字面量双精度存储尾差 ~1e-29
 
@@ -366,11 +368,25 @@ def test_gradient_zero_nominal_without_bias_unchanged():
 def test_gradient_widening_stops_at_domain_boundary():
     # 放大步长越过 sqrt 定义域（x-h<0）时保留上一个有限步长，不抛 NaN。
     # y = 1 + 1e-10*sqrt(x)，x0=1e-8：初始差分被偏置 1 淹没触发放大，
-    # 放大后的步长越过 0 => NaN 必须被截住。
+    # 放大后的步长越过 0 => NaN 必须被截住；中心差分到不了 h_cap、差分值
+    # 达不到偏置舍入门槛，但域内单侧探针确认依赖后该分量判为可辨（非零）。
     from app.expressions import compile_expression
     from app.engine import numerical_gradient_with_noise
 
     expr = compile_expression("1.0 + 1e-10*sqrt(x)", ("x",))
-    grad, noise = numerical_gradient_with_noise(expr, {"x": 1e-8}, ("x",))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, {"x": 1e-8}, ("x",))
     assert np.isfinite(grad[0])
     assert grad[0] > 0.0  # 真实正斜率 1e-10/(2*sqrt(1e-8)) = 5e-7
+    assert bool(resolved[0]) is True  # 单侧探针确认依赖：不得误判为零
+
+
+def test_gradient_domain_boundary_true_zero_stays_zero():
+    # 同一边界结构下的真零方向（0.0*sqrt(x)）：单侧探针到 h_cap 差值恒为 0，
+    # 维持零结论（梯度严格 0、不可辨）。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    expr = compile_expression("1.0 + 0.0*sqrt(x)", ("x",))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, {"x": 1e-8}, ("x",))
+    assert grad[0] == 0.0
+    assert bool(resolved[0]) is False

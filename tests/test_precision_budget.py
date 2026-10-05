@@ -534,6 +534,97 @@ def test_biased_model_evaluation_pipeline_still_works(client):
 
 
 # ---------------------------------------------------------------------------
+# 定义域边界：中心差分扩步被截断时，域内单侧探针确认真实斜率
+# ---------------------------------------------------------------------------
+
+def _sqrt_boundary_model(version: str):
+    return {
+        "version": version,
+        "expression": "1.0 + 1e-10*sqrt(x)",
+        "inputs": [
+            {"name": "x", "value": 1e-8, "unit": "dimensionless",
+             "standard_uncertainty": 1e-9, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+
+
+def test_domain_boundary_slope_recovered_closed_interval(client):
+    # y = 1.0 + 1e-10*sqrt(x)，x0 = 1e-8、ux = 1e-9，目标 1e-7，真实斜率 5e-7。
+    # 中心差分扩步在 x-h<0 处被定义域截断（h 到不了 h_cap），差分值 2h·g
+    # 达不到偏置 1.0 的百倍舍入门槛 -> 旧实现按噪声门槛误判零斜率、upper=null。
+    # 域内单侧探针放大到 h_cap 确认依赖后，斜率取边界内中心差分估计：
+    # v(u) = (g·u)^2 <= 1e-14 => u ∈ [0, ~0.19]（理论 0.2）闭区间，当前值达标。
+    _register(client, _sqrt_boundary_model("pb-sqrt-boundary"))
+    r = _budget(client, "pb-sqrt-boundary", "x", 1e-7)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 灵敏度恢复到 5e-7 附近（边界内中心差分估计，相对误差 ~4%）
+    assert 4.5e-7 < body["sensitivity"]["coefficient"] < 5.5e-7
+    assert body["sensitivity"]["unit"] == "dimensionless/dimensionless"
+    iv = body["interval"]
+    assert iv["feasible"] is True
+    assert iv["unbounded_upper"] is False
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True   # 独立输入零端点闭
+    assert abs(iv["upper"] - 0.19216334179121) < 1e-9            # 理论 0.2
+    assert iv["upper_inclusive"] is True
+    # 当前 ux = 1e-9 => uc ≈ 5.2e-16 ≤ 1e-7，达标
+    assert body["satisfied"] is True
+    assert body["current_combined_standard_uncertainty"]["value"] < 1e-7
+
+
+def test_domain_boundary_gradient_matches_gum_pipeline(client):
+    # 反求与 GUM 传播共用同一梯度路径：同一模型的 GUM 合成标准不确定度
+    # 必须等于反求响应中的当前合成标准不确定度。
+    payload = {
+        "model_version": "pb-sqrt-boundary",
+        "inputs": _sqrt_boundary_model("pb-sqrt-boundary")["inputs"],
+        "correlations": [],
+        "n": 5000, "seed": 20261005, "idempotency_key": "pb-sqrt-eval-0001",
+    }
+    r = client.post("/api/v1/evaluations", json=payload)
+    assert r.status_code == 201, r.text
+    gum_uc = r.json()["result"]["combined"]["gum"]["standard_uncertainty"]
+    body = _budget(client, "pb-sqrt-boundary", "x", 1e-7).json()
+    assert body["current_combined_standard_uncertainty"]["value"] == gum_uc
+
+
+def test_domain_boundary_true_zero_slope_still_unbounded(client):
+    # 同一边界结构下的真零斜率（0.0*sqrt(x)）：单侧探针到 h_cap 差值恒为 0，
+    # 零灵敏度裁决不变 -> 任意 ux 可行，无上界。
+    model = {
+        "version": "pb-sqrt-flat",
+        "expression": "1.0 + 0.0*sqrt(x)",
+        "inputs": [
+            {"name": "x", "value": 1e-8, "unit": "dimensionless",
+             "standard_uncertainty": 1e-9, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    body = _budget(client, "pb-sqrt-flat", "x", 1e-7).json()
+    assert body["sensitivity"]["coefficient"] == 0.0
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is True
+    assert iv["upper"] is None and iv["upper_inclusive"] is False
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert body["satisfied"] is True
+
+
+def test_domain_boundary_tight_target_not_satisfied(client):
+    # 同一边界模型，目标 1e-16 < 当前 uc ≈ 5.2e-16：上界随目标收缩
+    # （u ≤ t/g ≈ 1.9e-10），当前值不达标。
+    body = _budget(client, "pb-sqrt-boundary", "x", 1e-16).json()
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    # 响应序列化保留 15 位小数：1.9216334179121e-10 -> 1.92163e-10
+    assert abs(iv["upper"] - 1.92163e-10) < 1e-20
+    assert body["satisfied"] is False
+
+
+# ---------------------------------------------------------------------------
 # 只读语义：不改模型、不写计算记录；既有功能不受影响
 # ---------------------------------------------------------------------------
 

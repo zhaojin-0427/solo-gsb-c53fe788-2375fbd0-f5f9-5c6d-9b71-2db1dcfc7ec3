@@ -273,15 +273,16 @@ def _evaluate_scalar(compiled: CompiledExpression, env_base: Mapping[str, float]
 
 def numerical_gradient(compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]) -> np.ndarray:
     """中心差分灵敏度 dy/dx（基本单位空间）。"""
-    grad, _ = numerical_gradient_with_noise(compiled, x_base, names)
+    grad, _, _ = numerical_gradient_with_noise(compiled, x_base, names)
     return grad
 
 
 #: 名义点灵敏度判定为“零”的噪声倍数：中心差分差分值 |f(x+h)-f(x-h)|
 #: （等价地 |g_k|·2h）不超过输出舍入尺度的该倍数时，视为被输出偏置的
 #: 舍入噪声淹没（如 2*(a-a) 恰为 0）。倍数 >1 只为覆盖多步运算累积的
-#: 舍入。services 的零灵敏度裁决必须复用同一倍数，保证“差分不清”与
-#: “梯度判零”两条路径口径一致。
+#: 舍入。services 的零灵敏度裁决必须复用引擎基于同一倍数的可辨结论
+#: （numerical_gradient_with_noise 返回的 resolved 标记），保证“差分不清”
+#: 与“梯度判零”两条路径口径一致。
 GRADIENT_RESOLUTION_FACTOR = 100.0
 
 #: 零/近零名义点处差分步长向上放大的几何因子；上限 h_cap = eps^(1/3) 是
@@ -297,10 +298,10 @@ _GRADIENT_STABILITY = 0.5
 
 def numerical_gradient_with_noise(
     compiled: CompiledExpression, x_base: Mapping[str, float], names: tuple[str, ...]
-) -> tuple[np.ndarray, np.ndarray]:
-    """中心差分灵敏度及其逐分量舍入误差尺度（基本单位空间）。
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """中心差分灵敏度及其逐分量舍入误差尺度与可辨结论（基本单位空间）。
 
-    返回 ``(grad, noise)``。``noise[k]`` 估计函数值舍入（~eps·|f|）经
+    返回 ``(grad, noise, resolved)``。``noise[k]`` 估计函数值舍入（~eps·|f|）经
     ``(f(x+h)-f(x-h))/(2h)`` 传播到第 k 个梯度分量的量级：
 
         noise[k] = eps · max(|f(x+h)|, |f(x-h)|) / (2h)
@@ -308,6 +309,11 @@ def numerical_gradient_with_noise(
     它随问题自身尺度收缩（小量级模型的 noise 同样小）。真实梯度只有
     远低于该尺度时才与舍入噪声不可区分——“零灵敏度”裁决必须用它
     （逐输入、按自身尺度），绝不能与其他输入的灵敏度量级比较。
+
+    ``resolved[k]`` 是引擎对该分量“梯度与零可区分”的最终结论：初始步长
+    可辨、自适应放大后可辨、或中心差分被定义域边界截断时经域内单侧探针
+    确认依赖（见下）。services 的零灵敏度裁决必须直接复用该结论，保证
+    “差分不清”与“梯度判零”两条路径口径一致。
 
     **输出偏置自适应步长。** 名义点为 0（或极小）时初始步长
     ``h0 = eps^(2/3)`` 也极小；若输出在名义点带大偏置（如 y = 1 + 1e-4·b，
@@ -327,9 +333,24 @@ def numerical_gradient_with_noise(
     步长（初始 h0 就非有限时依旧抛错，与历史行为一致）。真正零/无扰动
     方向（f+ == f- 恒成立，如 ``2*(a-a)``）逐级放大到上限仍不可辨，
     梯度保持 0.0，噪声按最终步长（只会更严格）计算。
+
+    **定义域边界截断时的单侧确认。** 中心差分扩步可能被定义域提前截断
+    （如 ``1.0 + 1e-10*sqrt(x)`` 在 x0 = 1e-8 处：h 稍大于 x0 即 x-h < 0，
+    步长到不了 h_cap），此时差分值 |f+−f-| = |g|·2h 被步长上限钳在偏置
+    舍入门槛之下，真实非零斜率（~5e-7）若按噪声门槛裁决会被误判为零。
+    因此当扩步因越过定义域而停止且差分仍不可辨时，改用**域内单侧探针**
+    （只需 x0±h 一侧留在域内）从当前步长继续放大到 h_cap：输出若确实
+    依赖该输入，|f(x0±h) − f(x0)| 随 h 增长并越过同一可辨门槛，即确认
+    梯度非零（``resolved[k] = True``）。注意单侧探针只裁决“是否依赖”：
+    斜率值仍取边界内最后一个中心差分估计——单侧一阶差分的截断误差
+    O(h) 在高曲率点（sqrt 近 0）会淹没甚至反转真实斜率，不能用作斜率。
+    两个方向都尝试（左边界如 sqrt/log 用 +h，右边界如 asin 在 x→1⁻
+    用 −h）；两个方向到 h_cap 都不可辨（如 ``0.0*sqrt(x)`` 差值恒为 0）
+    才维持零结论。
     """
     grad = np.zeros(len(names))
     noise = np.zeros(len(names))
+    resolved_mask = np.zeros(len(names), dtype=bool)
     for k, name in enumerate(names):
         x0 = x_base[name]
         h = _EPS13 * max(abs(x0), _EPS13)
@@ -355,13 +376,15 @@ def numerical_gradient_with_noise(
 
         # 阶段 1：差分值被输出舍入淹没 => 放大步长直到可辨或到达 h_cap
         grew = False
+        blocked = False
         if not resolved:
             while not resolved and h < h_cap:
                 hn = min(h * _GRADIENT_STEP_GROWTH, h_cap)
                 try:
                     ynp, ynm, gnew, rnew = probe(hn)
                 except PropagationError:
-                    break  # 放大越过定义域：保留当前有限步长
+                    blocked = True  # 放大越过定义域：保留当前有限步长
+                    break
                 h, yp, ym, g, resolved = hn, ynp, ynm, gnew, rnew
                 grew = True
 
@@ -380,9 +403,57 @@ def numerical_gradient_with_noise(
                     break  # 截断接管（或可辨性丧失）：保留当前 (h, g, yp, ym)
                 h, yp, ym, g, resolved = hn, ypn, ymn, gn, rn
 
+        # 定义域边界截断且差分不可辨：用域内单侧探针确认输出是否真的
+        # 依赖该输入（确认的是“非零”，斜率值仍用上面的中心差分估计）。
+        if not resolved and blocked:
+            resolved = _onesided_dependence_resolved(compiled, x_base, name, x0, h, h_cap)
+
         grad[k] = g
         noise[k] = _EPS * max(abs(yp), abs(ym)) / (2.0 * h)
-    return grad, noise
+        resolved_mask[k] = resolved
+    return grad, noise, resolved_mask
+
+
+def _onesided_dependence_resolved(
+    compiled: CompiledExpression,
+    x_base: Mapping[str, float],
+    name: str,
+    x0: float,
+    h: float,
+    h_cap: float,
+) -> bool:
+    """中心差分被定义域边界截断时，用域内单侧探针裁决输出是否依赖该输入。
+
+    中心差分在边界处无法把步长放大到 h_cap（如 ``sqrt(x)`` 在极小正名义点
+    x-h < 0），差分值可能永远达不到 ``GRADIENT_RESOLUTION_FACTOR·eps·|f|``
+    的可辨门槛，真实非零斜率会被误判为零。单侧探针只需 x0±h 一侧留在域内，
+    可以从当前步长继续放大到 h_cap：输出若确实依赖该输入，
+    ``|f(x0±h) − f(x0)|`` 随 h 增长，总会在某一步越过同一可辨门槛
+    （如 ``1.0 + 1e-10*sqrt(x)`` 在 x0 = 1e-8 处，h ≈ 1.5e-7 时变化量
+    ~3e-14 > 门槛 2.2e-14）；真零方向（如 ``0.0*sqrt(x)``）在任意步长上
+    差值恒为 0 或纯舍入。先试 +h（左边界，如 sqrt/log 在 x→0⁺），越界
+    再试 −h（右边界，如 asin 在 x→1⁻）。
+
+    该探针只用于“是否依赖”的裁决，不用于斜率值：单侧一阶差分的截断
+    误差 O(h) 在高曲率点（sqrt 近 0 处 f''·h 可超过 |g| 本身）会淹没
+    真实斜率，斜率必须取边界内步长受控的中心差分估计。
+    """
+    with np.errstate(all="ignore"):
+        f0 = _evaluate_scalar(compiled, x_base)
+    for sign in (1.0, -1.0):
+        step = h
+        while step < h_cap:
+            step = min(step * _GRADIENT_STEP_GROWTH, h_cap)
+            env = dict(x_base)
+            env[name] = x0 + sign * step
+            try:
+                with np.errstate(all="ignore"):
+                    f1 = _evaluate_scalar(compiled, env)
+            except PropagationError:
+                break  # 该方向越界：换另一方向
+            if abs(f1 - f0) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(f0), abs(f1)):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------

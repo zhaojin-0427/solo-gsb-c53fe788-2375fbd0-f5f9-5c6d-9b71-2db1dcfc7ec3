@@ -129,3 +129,36 @@ else:
 print("当前登记值是否达标:", d["satisfied"],
       "| 当前 uc(y) =", d["current_combined_standard_uncertainty"]["value"])
 PY
+
+echo "== 8. 近定义域边界反求（y=1+1e-10*sqrt(x)，x0=1e-8，上界约 0.2）=="
+# 中心差分扩步被 sqrt 定义域截断（x-h<0）；域内单侧探针确认真实斜率 5e-7
+curl -sS -X POST "$BASE/api/v1/models" -H 'Content-Type: application/json' -d '{
+  "version": "budget-sqrt-boundary",
+  "name": "近定义域边界的小斜率 y=1+1e-10*sqrt(x)",
+  "expression": "1.0 + 1e-10*sqrt(x)",
+  "inputs": [
+    {"name": "x", "value": 1e-8, "unit": "dimensionless", "standard_uncertainty": 1e-9, "distribution": "normal"}
+  ],
+  "output_unit": "dimensionless"
+}' -o /dev/null -w "model  : HTTP %{http_code}\n" || true
+
+curl -sS -X POST "$BASE/api/v1/precision-budgets" -H 'Content-Type: application/json' -d '{
+  "model_version": "budget-sqrt-boundary",
+  "input_name": "x",
+  "target": {"standard_uncertainty": 1e-7, "unit": "dimensionless"}
+}' -o /tmp/budget_sqrt_resp.json -w "budget : HTTP %{http_code}\n"
+
+python3 - <<'PY'
+import json
+d = json.load(open('/tmp/budget_sqrt_resp.json'))
+iv = d["interval"]
+print("灵敏度:", d["sensitivity"]["coefficient"], "（真实 5e-7，边界截断不得判零）")
+if iv["unbounded_upper"]:
+    print("错误：有限预算被判为无上界")
+else:
+    lo = "[" if iv["lower_inclusive"] else "("
+    hi = "]" if iv["upper_inclusive"] else ")"
+    print(f"可行 ux 区间: {lo}{iv['lower']}, {iv['upper']}{hi}  （理论 [0, 0.2]，闭区间）")
+print("当前登记值是否达标:", d["satisfied"],
+      "| 当前 uc(y) =", d["current_combined_standard_uncertainty"]["value"])
+PY
